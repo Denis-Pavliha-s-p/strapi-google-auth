@@ -83,7 +83,7 @@ module.exports = ({ strapi }) => ({
         const connectonURL = this.getConnectionUrl(auth, scopes);
         resolve({ url: connectonURL })
       } catch (error) {
-        console.log(error);
+        //console.log(error);
         reject(error);
       }
     })
@@ -111,37 +111,90 @@ module.exports = ({ strapi }) => ({
           audience: google_client_id
         });
         const payload = ticket.getPayload();
-        const { name, email } = payload;
+        const { email, given_name, family_name, picture, email_verified } = payload;
         const user = await strapi.db.query('plugin::users-permissions.user').findOne({ where: { email } });
         if (!user) {
           let randomPass = this.makeRandomPassword(10);
           let password = await strapi.service("admin::auth").hashPassword(randomPass);
           let newUser = await strapi.db.query('plugin::users-permissions.user').create({
             data: {
-              username: name,
+              username: email,
               email,
               password,
-              confirmed: true,
+              confirmed: email_verified,
               blocked: false,
               role: 1,
-              provider: "local"
+              provider: "local",
+              firstname: given_name,
+              lastname: family_name,
+              avatarSso: picture,
+              plan: null
             }
-          })
+          });
           return resolve({
             data: {
               token: strapi.plugin('users-permissions').service("jwt").issue(_.pick(newUser, ['id'])),
               user: strapi.service('admin::user').sanitizeUser(newUser),
             },
           })
+        };
+        
+        ////// inject data into user
+        const injectedUser = user;
+
+        //// inject plan data
+        const planData = await strapi.db.query('plugin::users-permissions.user').findOne({
+          select: [],
+          where: { id: injectedUser.id },
+          populate: { plan: true },
+        });
+        injectedUser.plan = planData.plan?.key;
+        
+
+        //// inject payment method
+        const paymentMethodData = await strapi.db.query('api::payment-method.payment-method').findOne({
+          select: [],
+          where: { owner: injectedUser.id },
+          populate: { type: true, label: true },
+        });
+
+        if (paymentMethodData !== null) { 
+          // find if payment method is about to expire
+          const datePaymentMethodExpiry = new Date(paymentMethodData.expiry);
+          const dateToday = new Date();
+          const oneDay = 24 * 60 * 60 * 1000;
+          const diffDates = Math.round((datePaymentMethodExpiry.getTime() - dateToday.getTime()) / oneDay);
+          const approachingSoon = diffDates < 60;
+          
+          let paymentMethod = {
+            method: paymentMethodData.method,
+            type: paymentMethodData.type,
+            identifier: paymentMethodData.identifier,                  
+            expiry: {
+              date: paymentMethodData.expiry,
+              approachingSoon: approachingSoon
+            }
+          };
+
+          // only return subscriptionId to user when payment method is about to expire
+          if (approachingSoon) {
+            paymentMethod.expiry['subscriptionId'] = paymentMethodData.subscriptionId;
+          }
+
+          injectedUser.paymentMethod = paymentMethod;
+        } else {
+          injectedUser.paymentMethod = null;
         }
+
+        
         resolve({
           data: {
-            token: strapi.plugin('users-permissions').service("jwt").issue({ id: user.id }),
-            user: strapi.service('admin::user').sanitizeUser(user),
+            token: strapi.plugin('users-permissions').service("jwt").issue({ id: injectedUser.id }),
+            user: strapi.service('admin::user').sanitizeUser(injectedUser),
           },
         })
       } catch (error) {
-        console.log(error);
+        //console.log(error);
         reject(error);
       }
     })
@@ -150,14 +203,61 @@ module.exports = ({ strapi }) => ({
   async getUserDetailsFromToken(token) {
     return new Promise(async (resolve, reject) => {
       try {
-        const payload = await strapi.plugin('users-permissions').service("jwt").verify(token);
-        const userID = payload.id;
-        let user = await strapi.plugin('users-permissions').service("user").fetchAuthenticatedUser(userID);
-        const userSchema = strapi.getModel('plugin::users-permissions.user');
-        user = await sanitize.sanitizers.defaultSanitizeOutput(userSchema, user);
+        const payload = await strapi.plugin('users-permissions').service("jwt").verify(token);               
+        let user = await strapi.plugin('users-permissions').service("user").fetchAuthenticatedUser(payload.id);       
+        const userSchema = strapi.getModel('plugin::users-permissions.user');  
+
+
+        //// inject plan data
+        const planData = await strapi.db.query('plugin::users-permissions.user').findOne({
+          select: [],
+          where: { id: user.id },
+          populate: { plan: true },
+        });
+        user.plan = planData.plan?.key;
+        
+
+        //// inject payment method
+        const paymentMethodData = await strapi.db.query('api::payment-method.payment-method').findOne({
+          select: [],
+          where: { owner: user.id },
+          populate: { type: true, label: true },
+        });
+
+        if (paymentMethodData !== null) {
+          // find if payment method is about to expire
+          const datePaymentMethodExpiry = new Date(paymentMethodData.expiry);
+          const dateToday = new Date();
+          const oneDay = 24 * 60 * 60 * 1000;
+          const diffDates = Math.round((datePaymentMethodExpiry.getTime() - dateToday.getTime()) / oneDay);
+          const approachingSoon = diffDates < 60;
+          
+          let paymentMethod = {
+            method: paymentMethodData.method,
+            type: paymentMethodData.type,
+            identifier: paymentMethodData.identifier,                  
+            expiry: {
+              date: paymentMethodData.expiry,
+              approachingSoon: approachingSoon
+            }
+          };
+
+          // only return subscriptionId to user when payment method is about to expire
+          if (approachingSoon) {
+            paymentMethod.expiry['subscriptionId'] = paymentMethodData.subscriptionId;
+          }
+
+          user.paymentMethod = paymentMethod;
+        } else { 
+          user.paymentMethod = null;
+        }
+      
+
+
+        user = await sanitize.sanitizers.defaultSanitizeOutput(userSchema, user);       
         resolve(user);
       } catch (error) {
-        console.log(error);
+        //console.log(error);
         reject(error);
       }
     })
